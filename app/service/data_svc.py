@@ -316,5 +316,5 @@ class DataService(DataServiceInterface, BaseService):
 
     async def _verify_adversary_profiles(self):
         for adv in await self.locate('adversaries'):
-            if not adv.objective:
+#            if not adv.objective:
                 adv.objective = '495a9828-cab1-44dd-a0ca-66e58177d8cc'
