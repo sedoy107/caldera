@@ -11,6 +11,7 @@ class BaseObject(BaseWorld):
 
     def __init__(self):
         self._access = self.Access.APP
+        self._created = self.get_current_timestamp()
 
     def match(self, criteria):
         if not criteria:
@@ -56,6 +57,10 @@ class BaseObject(BaseWorld):
         return self._access
 
     @property
+    def created(self):
+        return self._created
+
+    @property
     def display(self):
         if self.display_schema:
             dumped = self.display_schema.dump(self)
@@ -68,6 +73,10 @@ class BaseObject(BaseWorld):
     @access.setter
     def access(self, value):
         self._access = value
+
+    @created.setter
+    def created(self, value):
+        self._created = value
 
     def replace_app_props(self, encoded_string):
         if encoded_string:

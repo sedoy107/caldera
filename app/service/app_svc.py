@@ -62,8 +62,16 @@ class AppService(AppServiceInterface, BaseService):
         return self._check_links_for_match(unique, [op.chain for op in operations] + [a.links for a in agents])
 
     async def find_op_with_link(self, link_id):
+        """
+        Retrieves the operation that a link_id belongs to. Will search currently running
+        operations first.
+        """
         operations = await self.get_service('data_svc').locate('operations', match=dict(state='running'))
-        return next((o for o in operations if o.has_link(link_id)), None)
+        op = next((o for o in operations if o.has_link(link_id)), None)
+        if not op:
+            operations = await self.get_service('data_svc').locate('operations', match=dict())
+            op = next((o for o in operations if o.has_link(link_id)), None)
+        return op
 
     async def run_scheduler(self):
         while True:
@@ -96,7 +104,7 @@ class AppService(AppServiceInterface, BaseService):
                 await self.get_service('data_svc').store(plugin)
             if plugin.name in self.get_config('plugins'):
                 await plugin.enable(self.get_services())
-                self.log.debug('Enabled plugin: %s' % plugin.name)
+                self.log.info('Enabled plugin: %s' % plugin.name)
                 if not plugin.version:
                     self._errors.append(Error(plugin.name, 'plugin code is not a release version'))
 
@@ -133,7 +141,16 @@ class AppService(AppServiceInterface, BaseService):
 
     async def validate_requirement(self, requirement, params):
         if not self.check_requirement(params):
-            self.log.error('%s does not meet the minimum version of %s' % (requirement, params['version']))
+            msg = '%s does not meet the minimum version of %s' % (requirement, params['version'])
+            if params.get('optional', False):
+                msg = '. '.join([
+                    msg,
+                    '%s is an optional dependency and its absence will not affect Caldera\'s core operation' % requirement.capitalize(),
+                    params.get('reason', '')
+                ])
+                self.log.warning(msg)
+            else:
+                self.log.error(msg)
             self._errors.append(Error('requirement', '%s version needs to be >= %s' % (requirement, params['version'])))
             return False
         return True

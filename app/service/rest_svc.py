@@ -5,12 +5,15 @@ import os
 import pathlib
 import uuid
 from datetime import time
+import re
 
 import yaml
 from aiohttp import web
 
 from app.objects.c_adversary import Adversary
+from app.objects.c_objective import Objective
 from app.objects.c_operation import Operation
+from app.objects.c_source import Source
 from app.objects.c_schedule import Schedule
 from app.objects.secondclass.c_fact import Fact
 from app.service.interfaces.i_rest_svc import RestServiceInterface
@@ -24,26 +27,17 @@ class RestService(RestServiceInterface, BaseService):
         self.loop = asyncio.get_event_loop()
 
     async def persist_adversary(self, access, data):
-        i = data.pop('i')
-        obj_default = (await self._services.get('data_svc').locate('objectives', match=dict(name='default')))[0]
-        if not i:
-            i = str(uuid.uuid4())
-        _, file_path = await self.get_service('file_svc').find_file_path('%s.yml' % i, location='data')
-        if not file_path:
-            file_path = 'data/adversaries/%s.yml' % i
-            allowed = self._get_allowed_from_access(access)
+        """Persist adversaries. Accepts single adversary or bulk set of adversaries.
+        For bulk, supply dict of form {"bulk": [{<adversary>}, {<adversary>},...]}.
+        """
+        if data.get('bulk', False):
+            data = data['bulk']
         else:
-            allowed = (await self.get_service('data_svc').locate('adversaries', dict(adversary_id=i)))[0].access
-        with open(file_path, 'w+') as f:
-            f.seek(0)
-            p = list()
-            for ability in data.pop('atomic_ordering'):
-                p.append(ability['id'])
-            f.write(yaml.dump(dict(id=i, name=data.pop('name'), description=data.pop('description'),
-                                   atomic_ordering=p, objective=data.pop('objective', obj_default.id))))
-            f.truncate()
-        await self._services.get('data_svc').load_adversary_file(file_path, allowed)
-        return [a.display for a in await self._services.get('data_svc').locate('adversaries', dict(adversary_id=i))]
+            data = [data]
+        r = []
+        for adv in data:
+            r.extend(await self._persist_adversary(access, adv))
+        return r
 
     async def update_planner(self, data):
         planner = (await self.get_service('data_svc').locate('planners', dict(name=data['name'])))[0]
@@ -57,36 +51,43 @@ class RestService(RestServiceInterface, BaseService):
         await self.get_service('data_svc').store(planner)
 
     async def persist_ability(self, access, data):
-        _, file_path = await self.get_service('file_svc').find_file_path('%s.yml' % data.get('id'), location='data')
-        if not file_path:
-            d = 'data/abilities/%s' % data.get('tactic')
-            if not os.path.exists(d):
-                os.makedirs(d)
-            file_path = '%s/%s.yml' % (d, data.get('id'))
-            allowed = self._get_allowed_from_access(access)
+        """Persist abilities. Accepts single ability or bulk set of abilities.
+        For bulk, supply dict of form {"bulk": [{<ability>}, {<ability>},...]}.
+        """
+        if data.get('bulk', False):
+            data = data['bulk']
         else:
-            allowed = (await self.get_service('data_svc').locate('abilities',
-                                                                 dict(ability_id=data.get('id'))))[0].access
-        with open(file_path, 'w+') as f:
-            f.seek(0)
-            f.write(yaml.dump([data]))
-        await self.get_service('data_svc').remove('abilities', dict(ability_id=data.get('id')))
-        await self.get_service('data_svc').load_ability_file(file_path, allowed)
-        return [a.display for a in
-                await self.get_service('data_svc').locate('abilities', dict(ability_id=data.get('id')))]
+            data = [data]
+        r = []
+        for ab in data:
+            r.extend(await self._persist_ability(access, ab))
+        return r
 
     async def persist_source(self, access, data):
-        _, file_path = await self.get_service('file_svc').find_file_path('%s.yml' % data.get('id'), location='data')
-        if not file_path:
-            file_path = 'data/sources/%s.yml' % data.get('id')
-            allowed = self._get_allowed_from_access(access)
+        """Persist sources. Accepts single source or bulk set of sources.
+        For bulk, supply dict of form {"bulk": [{<sourc>}, {<source>},...]}.
+        """
+        if data.get('bulk', False):
+            data = data['bulk']
         else:
-            allowed = (await self.get_service('data_svc').locate('sources', dict(id=data.get('id'))))[0].access
-        with open(file_path, 'w+') as f:
-            f.seek(0)
-            f.write(yaml.dump(data))
-        await self._services.get('data_svc').load_source_file(file_path, allowed)
-        return [s.display for s in await self._services.get('data_svc').locate('sources', dict(id=data.get('id')))]
+            data = [data]
+        r = []
+        for source in data:
+            r.extend(await self._persist_source(access, source))
+        return r
+
+    async def persist_objective(self, access, data):
+        """Persist objectives. Accepts single objective or a bulk set of objectives.
+        For bulk, supply dict of form {"bulk": [{objective}, ...]}.
+        """
+        if data.get('bulk', False):
+            data = data['bulk']
+        else:
+            data = [data]
+        r = []
+        for obj in data:
+            r.extend(await self._persist_objective(access, obj))
+        return r
 
     async def delete_agent(self, data):
         await self.get_service('data_svc').remove('agents', data)
@@ -137,6 +138,7 @@ class RestService(RestServiceInterface, BaseService):
         paw = data.pop('paw', None)
         if paw is None:
             await self._update_global_props(**data)
+            return self.get_config(name='agents')
         for agent in await self.get_service('data_svc').locate('agents', match=dict(paw=paw)):
             await agent.gui_modification(**data)
             return agent.display
@@ -157,12 +159,16 @@ class RestService(RestServiceInterface, BaseService):
 
     async def create_schedule(self, access, data):
         operation = await self._build_operation_object(access, data['operation'])
-        scheduled = await self.get_service('data_svc').store(
-            Schedule(name=operation.name,
-                     schedule=time(data['schedule']['hour'], data['schedule']['minute'], 0),
-                     task=operation)
-        )
-        self.log.debug('Scheduled new operation (%s) for %s' % (operation.name, scheduled.schedule))
+        schedules = await self.get_service('data_svc').locate('schedules', match=dict(name=operation.name))
+        if schedules:
+            self.log.debug('A scheduled operation with the name "%s" already exists, skipping' % operation.name)
+        else:
+            scheduled = await self.get_service('data_svc').store(
+                Schedule(name=operation.name,
+                         schedule=time(data['schedule']['hour'], data['schedule']['minute'], 0),
+                         task=operation)
+            )
+            self.log.debug('Scheduled new operation (%s) for %s' % (operation.name, scheduled.schedule))
 
     async def list_payloads(self):
         payload_dirs = [pathlib.Path.cwd() / 'data' / 'payloads']
@@ -245,6 +251,19 @@ class RestService(RestServiceInterface, BaseService):
             operation[0].obfuscator = obfuscator
             self.log.debug('Updated operation=%s obfuscator to %s' % (op_id, operation[0].obfuscator))
 
+    async def get_agent_configuration(self, data):
+        abilities = await self.get_service('data_svc').locate('abilities', data)
+
+        raw_abilities = [{'platform': ability.platform, 'executor': ability.executor,
+                          'description': ability.description, 'command': ability.raw_command,
+                          'variations': [{'description': v.description, 'command': v.raw_command}
+                                         for v in ability.variations]}
+                         for ability in abilities]
+
+        app_config = {k: v for k, v in self.get_config().items() if k.startswith('app.')}
+
+        return dict(abilities=raw_abilities, app_config=app_config)
+
     """ PRIVATE """
 
     async def _build_operation_object(self, access, data):
@@ -313,15 +332,36 @@ class RestService(RestServiceInterface, BaseService):
         return Adversary.load(dict(adversary_id='ad-hoc', name='ad-hoc', description='an empty adversary profile', atomic_ordering=[]))
 
     async def _update_global_props(self, sleep_min, sleep_max, watchdog, untrusted, implant_name, bootstrap_abilities):
-        if implant_name:
-            self.set_config(name='agents', prop='implant_name', value=implant_name)
-        if bootstrap_abilities:
-            abilities = self.get_config(name='agents', prop='bootstrap_abilities')
-            abilities.append(bootstrap_abilities)
+        """Update global agent properties
+
+        :param sleep_min: Beacon min sleep time (seconds)
+        :type sleep_min: int
+        :param sleep_max: Beacon max sleep time (seconds)
+        :type sleep_max: int
+        :param watchdog: Watchdog timer (seconds)
+        :type watchdog: int
+        :param untrusted: Untrusted timer (seconds)
+        :type untrusted: int
+        :param implant_name: Agent file name
+        :type implant_name: str
+        :param bootstrap_abilities: Comma-separated ability UUIDs
+        :type bootstrap_abilities: str
+        """
         self.set_config(name='agents', prop='sleep_min', value=sleep_min)
         self.set_config(name='agents', prop='sleep_max', value=sleep_max)
         self.set_config(name='agents', prop='untrusted_timer', value=untrusted)
         self.set_config(name='agents', prop='watchdog', value=watchdog)
+        if implant_name:
+            self.set_config(name='agents', prop='implant_name', value=implant_name)
+        if bootstrap_abilities:
+            abilities = []
+            ability_ids = [ability_id.strip() for ability_id in bootstrap_abilities.split(',') if ability_id.strip()]
+            for ability_id in ability_ids:
+                if await self.get_service('data_svc').locate('abilities', dict(ability_id=ability_id.strip())):
+                    abilities.append(ability_id)
+                else:
+                    self.log.debug('Could not find ability with id "{}" for bootstrap'.format(ability_id))
+            self.set_config(name='agents', prop='bootstrap_abilities', value=abilities)
 
     async def _explode_display_results(self, object_name, results):
         if object_name == 'adversaries':
@@ -329,10 +369,10 @@ class RestService(RestServiceInterface, BaseService):
                 adv['atomic_ordering'] = [ab.display for ab_id in adv['atomic_ordering'] for ab in
                                           await self.get_service('data_svc').locate('abilities',
                                                                                     match=dict(ability_id=ab_id))]
-                adv['objective'] = [ab.display for ab in
-                                    await self.get_service('data_svc').locate('objectives',
-                                                                              match=dict(id=adv['objective']))][0]
-
+                if adv['objective']:
+                    adv['objective'] = [ob.display for ob in
+                                        await self.get_service('data_svc').locate('objectives',
+                                                                                  match=dict(id=adv['objective']))][0]
         return results
 
     async def _delete_data_from_memory_and_disk(self, ram_key, identifier, data):
@@ -344,3 +384,212 @@ class RestService(RestServiceInterface, BaseService):
         if os.path.exists(file_path):
             os.remove(file_path)
         return 'Delete action completed'
+
+    async def _persist_adversary(self, access, adv):
+        """Persist adversary.
+
+        Current policy for 'objective' field of adversary: If there isn't an
+        objective when an adversary is loaded from disk, it gets assigned a
+        default one, which will then get written out if the adversary is
+        explicitly saved. Newly created adversaries will also be given default
+        objective if created without one.
+        """
+        if not adv.get('id') or not adv['id']:
+            adv['id'] = str(uuid.uuid4())
+        obj_default = (await self._services.get('data_svc').locate('objectives', match=dict(name='default')))[0]
+        adv['atomic_ordering'] = [list(ab_dict.values())[0] for ab_dict in adv['atomic_ordering']]
+        _, file_path = await self.get_service('file_svc').find_file_path('%s.yml' % adv['id'], location='data')
+        if file_path:
+            # exists
+            current_adv = dict(self.strip_yml(file_path)[0])
+            allowed = (await self.get_service('data_svc').locate('adversaries', dict(adversary_id=adv['id'])))[0].access
+            current_adv.update(adv)
+            final = current_adv
+        else:
+            # new
+            file_path = 'data/adversaries/%s.yml' % adv['id']
+            allowed = self._get_allowed_from_access(access)
+            adv['objective'] = adv.get('objective', obj_default)
+            final = adv
+        # verfiy objective is valid
+        if len(await self.get_service('data_svc').locate('objectives', match=dict(id=final['objective']))) == 0:
+            final['objective'] = obj_default.id
+        await self._save_and_refresh_item(file_path, Adversary, final, allowed)
+        return [a.display for a in await self._services.get('data_svc').locate('adversaries', dict(adversary_id=final["id"]))]
+
+    async def _persist_ability(self, access, ab):
+        """Persist ability.
+
+        The model/format of the incoming ability (i.e. 'ab') is most similar to the ability
+        yaml file definition, with a few exceptions:
+          - 'platforms' sub-dict has sub executor keys split out versus a joined csv string
+          - 'platforms' executor sub-dicts dont have a 'parsers' field
+          - 'platforms' executor sub-dicts have a 'timeout' field
+
+        Update Strategy:
+            'new' ability is the ability dict that is supplied
+            'current' ability is the ability dict as read in directly from yaml file
+            ------------
+            - on new ability, stash executor timeouts and then drop from new ability
+            - on new ability, combine executors that are the same under common platform
+            - on current ability, stash parsers and then drop from current ability
+            - update current ability with new ability
+            - add parsers back in to current ability
+            - save current ability to disk, then re-load ability from file
+            - check/set executor timeouts on loaded abilities
+        :param access: Current access list
+        :type access: dict
+        :param ab: Ability to add or
+        :type ab: dict
+        :return: Created / updated ability
+        :rtype: List(Ability)
+        """
+        # Set ability ID if undefined
+        if not ab.get('id'):
+            ab['id'] = str(uuid.uuid4())
+
+        # Validate ID, used for file creation
+        validator = re.compile(r'^[a-zA-Z0-9-_]+$')
+        if not ab.get('id') or not validator.match(ab.get('id')):
+            self.log.debug('Invalid ability ID "%s". IDs can only contain '
+                           'alphanumeric characters, hyphens, and underscores.' % ab.get('id'))
+            return []
+
+        # Validate tactic, used for directory creation
+        if not ab.get('tactic') or not validator.match(ab.get('tactic')):
+            self.log.debug('Invalid ability tactic "%s". Tactics can only contain '
+                           'alphanumeric characters, hyphens, and underscores.' % ab.get('tactic'))
+            return []
+
+        # Validate platforms, ability will not be loaded if empty
+        if not ab.get('platforms'):
+            self.log.debug('At least one platform/executor is required to save ability.')
+            return []
+
+        # Create a new ability to be used for updating/creating
+        new_ability, new_ability_exec_timeouts = await self._prep_new_ability(ab)
+
+        # Update or create ability
+        _, file_path = await self.get_service('file_svc').find_file_path('{}.yml'.format(ab['id']), location='data')
+        if file_path:
+            # Ability exists, update
+            current_ability = dict(self.strip_yml(file_path)[0][0])
+            current_ability, current_parsers = await self._strip_parsers_from_ability(current_ability)
+            current_ability.update(new_ability)
+            final = await self._add_parsers_to_ability(current_ability, current_parsers)
+            # Get access
+            found_abilities = await self.get_service('data_svc').locate('abilities', dict(ability_id=ab['id']))
+            allowed = found_abilities[0].access if found_abilities else self._get_allowed_from_access(access)
+        else:
+            # Create new ability, create file / directory
+            tactic_dir = os.path.join('data', 'abilities', new_ability.get('tactic'))
+            if not os.path.exists(tactic_dir):
+                os.makedirs(tactic_dir)
+            file_path = os.path.join(tactic_dir, '%s.yml' % new_ability['id'])
+            final = new_ability
+            # Get access
+            allowed = self._get_allowed_from_access(access)
+
+        await self.get_service('file_svc').save_file(file_path, yaml.dump([final], encoding='utf-8'), '', encrypt=False)
+        await self.get_service('data_svc').remove('abilities', dict(ability_id=final['id']))
+        await self.get_service('data_svc').load_ability_file(file_path, allowed)
+        await self._restore_exec_timeouts(final['id'], new_ability_exec_timeouts)
+        return [a.display for a in
+                await self.get_service('data_svc').locate('abilities', dict(ability_id=final['id']))]
+
+    async def _persist_source(self, access, source):
+        return await self._persist_item(access, 'sources', Source, source)
+
+    async def _persist_objective(self, access, objective):
+        return await self._persist_item(access, 'objectives', Objective, objective)
+
+    async def _persist_item(self, access, object_class_name, object_class, item):
+        if not item.get('id') or not item['id']:
+            item['id'] = str(uuid.uuid4())
+        _, file_path = await self.get_service('file_svc').find_file_path('%s.yml' % item['id'], location='data')
+        if file_path:
+            current_item = dict(self.strip_yml(file_path)[0])
+            allowed = (await self.get_service('data_svc').locate(object_class_name, dict(id=item['id'])))[0].access
+            current_item.update(item)
+            final = item
+        else:
+            file_path = 'data/%s/%s.yml' % (object_class_name, item['id'])
+            allowed = self._get_allowed_from_access(access)
+            final = item
+        await self._save_and_refresh_item(file_path, object_class, final, allowed)
+        return [i.display for i in await self.get_service('data_svc').locate(object_class_name, dict(id=final['id']))]
+
+    async def _save_and_refresh_item(self, file_path, object_class, final, allowed):
+        await self.get_service('file_svc').save_file(file_path, yaml.dump(final, encoding='utf-8'), '', encrypt=False)
+        await self.get_service('data_svc').load_yaml_file(object_class, file_path, allowed)
+
+    async def _prep_new_ability(self, ab):
+        """Take an ability dict, supplied by frontend, extract executor timeouts,
+        and combine executor sub-dicts that are equivalent under a single CSV
+        formed key under the parent platform.
+
+        Return modified ability dict, and a seperate dict of the executor timeouts.
+        """
+        ability = copy.deepcopy(ab)
+        # remove and store executor timeouts
+        exec_timeouts = {}
+        for platform, executors in ability['platforms'].items():
+            exec_timeouts[platform] = {}
+            for executor, d in executors.items():
+                exec_timeouts[platform][executor] = d.get('timeout', 60)
+                if 'timeout' in ability['platforms'][platform][executor]:
+                    del ability['platforms'][platform][executor]['timeout']
+        # Combine executors under common CSV keys if they are the same
+        platforms = {}
+        for platform, executors in ability['platforms'].items():
+            platforms[platform] = {}
+            for executor, d in executors.items():
+                match = False
+                for executor_1, d_1 in platforms[platform].items():
+                    if d == d_1:
+                        match = executor_1
+                        break
+                if match:
+                    combined_key = ','.join([match, executor])
+                    platforms[platform][combined_key] = d
+                    # and remove previous single key in set
+                    del platforms[platform][match]
+                else:
+                    platforms[platform][executor] = d
+        ability['platforms'] = platforms
+        return ability, exec_timeouts
+
+    async def _strip_parsers_from_ability(self, ability):
+        """Remove the parsers sub-dict from the executors of an ability
+        (where the ability is not an ability object but just the loaded
+        dict from yaml ability file)
+
+        Return ability (minus parsers) and parsers as seperate dict
+        """
+        parsers = {}
+        for platform, executors in ability['platforms'].items():
+            parsers[platform] = {}
+            for executor, d in executors.items():
+                if d.get('parsers', False):
+                    parsers[platform][executor] = d['parsers']
+                    del ability["platforms"][platform][executor]['parsers']
+        return ability, parsers
+
+    async def _add_parsers_to_ability(self, ability, parsers):
+        """Add parsers back into an ability (where the ability is
+        not an ability object but just the loaded dict from yaml
+        ability file)
+        """
+        for platform, executors in ability['platforms'].items():
+            if parsers.get(platform, False):
+                for executor, _ in executors.items():
+                    if parsers[platform].get(executor, False):
+                        ability['platforms'][platform][executor]['parsers'] = parsers[platform][executor]
+        return ability
+
+    async def _restore_exec_timeouts(self, ability_id, exec_timeouts):
+        """For the supplied ability, set corresponding executor timeouts."""
+        abilities = await self.get_service('data_svc').locate('abilities', dict(ability_id=ability_id))
+        for ab in abilities:
+            ab.timeout = exec_timeouts[ab.platform][ab.executor]
+            await self.get_service('data_svc').store(ab)

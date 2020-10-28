@@ -82,6 +82,7 @@ class RestApi(BaseWorld):
                     adversaries=lambda d: self.rest_svc.persist_adversary(access, d),
                     abilities=lambda d: self.rest_svc.persist_ability(access, d),
                     sources=lambda d: self.rest_svc.persist_source(access, d),
+                    objectives=lambda d: self.rest_svc.persist_objective(access, d),
                     planners=lambda d: self.rest_svc.update_planner(d),
                     agents=lambda d: self.rest_svc.update_agent_data(d),
                     chain=lambda d: self.rest_svc.update_chain_data(d),
@@ -96,7 +97,8 @@ class RestApi(BaseWorld):
                     configuration=lambda d: self.rest_svc.update_config(d),
                     link=lambda d: self.rest_svc.get_potential_links(**d),
                     operation=lambda d: self.rest_svc.update_operation(**d),
-                    task=lambda d: self.rest_svc.task_agent_with_ability(**d)
+                    task=lambda d: self.rest_svc.task_agent_with_ability(**d),
+                    agent_configuration=lambda d: self.rest_svc.get_agent_configuration(d)
                 )
             )
             if index not in options[request.method]:

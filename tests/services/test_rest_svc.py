@@ -82,7 +82,7 @@ class TestRestSvc:
     def test_create_operation(self, loop, rest_svc, data_svc):
         want = {'name': 'Test',
                 'adversary': {'description': 'an empty adversary profile', 'name': 'ad-hoc', 'adversary_id': 'ad-hoc',
-                              'atomic_ordering': [], 'objective': None}, 'state': 'finished',
+                              'atomic_ordering': [], 'objective': None, 'tags': []}, 'state': 'finished',
                 'planner': {'name': 'test', 'description': None, 'module': 'test', 'stopping_conditions': [],
                             'params': {},
                             'ignore_enforcement_modules': [], 'id': '123'},
@@ -109,6 +109,48 @@ class TestRestSvc:
         internal_rest_svc = rest_svc(loop)
         response = loop.run_until_complete(internal_rest_svc.delete_ability(data=dict(ability_id='123')))
         assert 'Delete action completed' == response
+
+    def test_persist_objective_single_new(self, loop, rest_svc, file_svc):
+        internal_rest_svc = rest_svc(loop)
+        req = {
+                'name': 'new objective',
+                'description': 'test new objective',
+                'goals': [
+                    {
+                        'count': 1,
+                        'operator': '*',
+                        'target': 'host.user.name',
+                        'value': 'NA'
+                    }
+                ]
+            }
+        objs = loop.run_until_complete(internal_rest_svc.persist_objective({'access': [BaseWorld.Access.RED]}, req))
+        # clear out subobject difference
+        objs[0]['goals'][0].pop('achieved')
+        assert req.items() <= objs[0].items()
+
+    def test_persist_objective_single_existing(self, loop, rest_svc, file_svc):
+        internal_rest_svc = rest_svc(loop)
+        req = {
+                'name': 'new objective',
+                'description': 'test new objective',
+                'goals': [
+                    {
+                        'count': 1,
+                        'operator': '*',
+                        'target': 'host.user.name',
+                        'value': 'NA'
+                    }
+                ]
+            }
+        objs = loop.run_until_complete(internal_rest_svc.persist_objective({'access': [BaseWorld.Access.RED]}, req))
+        # clear out subobject difference
+        objs[0]['goals'][0].pop('achieved')
+        assert req.items() <= objs[0].items()
+        # modify
+        modified_req = {'id': objs[0]['id'], 'description': 'modified objective'}
+        modified_objs = loop.run_until_complete(internal_rest_svc.persist_objective({'access': [BaseWorld.Access.RED]}, modified_req))
+        assert modified_req.items() <= modified_objs[0].items()
 
     def test_delete_adversary(self, loop, rest_svc, file_svc):
         internal_rest_svc = rest_svc(loop)

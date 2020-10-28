@@ -9,6 +9,8 @@ from aiohttp_security.abc import AbstractAuthorizationPolicy
 from aiohttp_session import setup as setup_session
 from aiohttp_session.cookie_storage import EncryptedCookieStorage
 from cryptography import fernet
+import ldap3
+from ldap3.core.exceptions import LDAPAttributeError, LDAPException
 
 from app.service.interfaces.i_auth_svc import AuthServiceInterface
 from app.utility.base_service import BaseService
@@ -48,12 +50,14 @@ class AuthService(AuthServiceInterface, BaseService):
     def __init__(self):
         self.user_map = dict()
         self.log = self.add_service('auth_svc', self)
+        self.ldap_config = self.get_config('ldap')
 
     async def apply(self, app, users):
-        for group, u in users.items():
-            self.log.debug('Created authentication group: %s' % group)
-            for k, v in u.items():
-                self.user_map[k] = self.User(k, v, (group, 'app'), )
+        if users:
+            for group, user in users.items():
+                self.log.debug('Created authentication group: %s' % group)
+                for username, password in user.items():
+                    await self.create_user(username, password, group)
         app.user_map = self.user_map
         fernet_key = fernet.Fernet.generate_key()
         secret_key = base64.urlsafe_b64decode(fernet_key)
@@ -61,6 +65,9 @@ class AuthService(AuthServiceInterface, BaseService):
         setup_session(app, storage)
         policy = SessionIdentityPolicy()
         setup_security(app, policy, DictionaryAuthorizationPolicy(self.user_map))
+
+    async def create_user(self, username, password, group):
+        self.user_map[username] = self.User(username, password, (group, 'app'), )
 
     @staticmethod
     async def logout_user(request):
@@ -74,13 +81,19 @@ class AuthService(AuthServiceInterface, BaseService):
         :return: the response/location of where the user is trying to navigate
         """
         data = await request.post()
-        verified = await self._check_credentials(request.app.user_map, data.get('username'), data.get('password'))
-        response = web.HTTPFound('/')
+        username = data.get('username')
+        password = data.get('password')
+        if self.ldap_config:
+            verified = await self._ldap_login(username, password)
+        else:
+            verified = await self._check_credentials(request.app.user_map, username, password)
+
         if verified:
-            self.log.debug('%s logging in:' % data.get('username'))
-            await remember(request, response, data.get('username'))
+            self.log.debug('%s logging in:' % username)
+            response = web.HTTPFound('/')
+            await remember(request, response, username)
             raise response
-        self.log.debug('%s failed login attempt: ' % data.get('username'))
+        self.log.debug('%s failed login attempt: ' % username)
         raise web.HTTPFound('/login')
 
     async def check_permissions(self, group, request):
@@ -111,6 +124,41 @@ class AuthService(AuthServiceInterface, BaseService):
         if not user:
             return False
         return user.password == password
+
+    async def _ldap_login(self, username, password):
+        server = ldap3.Server(self.ldap_config.get('server'))
+        dn = self.ldap_config.get('dn')
+        user_attr = self.ldap_config.get('user_attr') or 'uid'
+        user_string = '%s=%s,%s' % (user_attr, username, dn)
+
+        try:
+            with ldap3.Connection(server, user=user_string, password=password) as conn:
+                if conn.bind():
+                    if username not in self.user_map:
+                        group = await self._ldap_get_group(conn, dn, username, user_attr)
+                        await self.create_user(username, None, group)
+                    return True
+        except LDAPException:
+            self.log.error('Unable to connect to LDAP server')
+
+        return False
+
+    async def _ldap_get_group(self, connection, dn, username, user_attr):
+        group_attr = self.ldap_config.get('group_attr') or 'objectClass'
+        red_group_name = self.ldap_config.get('red_group') or 'red'
+
+        try:
+            connection.search(dn, '(%s=%s)' % (user_attr, username), attributes=[group_attr])
+        except LDAPAttributeError:
+            self.log.error('Invalid group_attr in config: %s' % group_attr)
+            return 'blue'
+
+        groups_result = connection.entries[0][group_attr].value
+        if ((isinstance(groups_result, list) and red_group_name in groups_result)
+                or red_group_name == groups_result):
+            return 'red'
+        else:
+            return 'blue'
 
 
 class DictionaryAuthorizationPolicy(AbstractAuthorizationPolicy):
